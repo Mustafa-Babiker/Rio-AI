@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: rio-novel-studio
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --workers 1 --threads 4 --timeout 120
+    healthCheckPath: /health
+    envVars:
+      - key: SECRET_KEY
+        generateValue: true
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-2.5-flash-lite
+      - key: RIO_ADMIN_USERNAME
+        sync: false
+      - key: RIO_ADMIN_PASSWORD
+        sync: false
+      - key: COOKIE_SECURE
+        value: "true"
