@@ -1,22 +1,71 @@
 import os
 import sqlite3
 import secrets
+from pathlib import Path
 from datetime import datetime, timezone
+
 from flask import Flask, request, jsonify, render_template, session
 from google import genai
 
+
 # ============================================================
-# RIO CONFIGURATION
-# Paste your NEW keys between the quotes below.
-# Do not use a Gemini API key that has already been exposed.
+# Load .env locally, if present.
+# Render uses its Dashboard Environment Variables instead.
 # ============================================================
-SECRET_KEY = "e3982c9f526afb7c2e0ec3a91ccccd791a458bfb6e8c0fd5c245eb082069c50c"
-GEMINI_API_KEY = "AQ.Ab8RN6KkixaecqBYColB4vK9iF78Zzm46pkRFB5WXQZmdFBDNA"
-GEMINI_MODEL = "gemini-3.8-flash"
-COOKIE_SECURE = False  # Set True only when using HTTPS in production.
+
+BASE_DIR = Path(__file__).resolve().parent
+ENV_FILE = BASE_DIR / ".env"
+
+
+def load_local_env():
+    if not ENV_FILE.is_file():
+        return
+
+    try:
+        for raw_line in ENV_FILE.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+
+            name, value = line.split("=", 1)
+            name = name.strip()
+            value = value.strip()
+
+            if len(value) >= 2 and value[0] == value[-1]:
+                if value[0] in ("'", '"'):
+                    value = value[1:-1]
+
+            # Existing system/Render variables take precedence.
+            if name and name not in os.environ:
+                os.environ[name] = value
+    except OSError:
+        pass
+
+
+load_local_env()
+
+
+# ============================================================
+# Configuration
+# ============================================================
+
+SECRET_KEY = (
+    os.getenv("RIO_SECRET_KEY")
+    or os.getenv("SECRET_KEY")
+    or secrets.token_hex(32)
+)
+
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
+
+COOKIE_SECURE = os.getenv(
+    "COOKIE_SECURE",
+    "true" if os.getenv("RENDER") else "false",
+).strip().lower() in ("1", "true", "yes", "on")
 
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
+
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
@@ -24,11 +73,19 @@ app.config.update(
     MAX_CONTENT_LENGTH=1_000_000,
 )
 
-DATA_DIR = os.getenv("RIO_DATA_DIR", "/tmp" if os.getenv("RENDER") else ".")
+DATA_DIR = os.getenv(
+    "RIO_DATA_DIR",
+    "/tmp" if os.getenv("RENDER") else str(BASE_DIR),
+)
 os.makedirs(DATA_DIR, exist_ok=True)
+
 DB_PATH = os.path.join(DATA_DIR, "rio_temporary.sqlite3")
 MODEL = GEMINI_MODEL
 
+
+# ============================================================
+# Database
+# ============================================================
 
 def now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -48,10 +105,12 @@ def init_db():
                 token TEXT UNIQUE NOT NULL,
                 created_at TEXT NOT NULL
             );
+
             CREATE TABLE IF NOT EXISTS messages (
                 id INTEGER PRIMARY KEY,
                 guest_id INTEGER NOT NULL,
-                role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
+                role TEXT NOT NULL
+                    CHECK(role IN ('user', 'assistant')),
                 content TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 FOREIGN KEY(guest_id) REFERENCES guests(id)
@@ -62,19 +121,24 @@ def init_db():
 
 def current_guest(create=True):
     guest_id = session.get("rio_guest_id")
+
     if guest_id:
         with db() as connection:
             row = connection.execute(
-                "SELECT id, token FROM guests WHERE id=?", (guest_id,)
+                "SELECT id, token FROM guests WHERE id = ?",
+                (guest_id,),
             ).fetchone()
+
         if row:
             return row
+
         session.pop("rio_guest_id", None)
 
     if not create:
         return None
 
     token = secrets.token_urlsafe(32)
+
     with db() as connection:
         cursor = connection.execute(
             "INSERT INTO guests(token, created_at) VALUES(?, ?)",
@@ -84,11 +148,17 @@ def current_guest(create=True):
         guest_id = cursor.lastrowid
 
     session["rio_guest_id"] = guest_id
+
     with db() as connection:
         return connection.execute(
-            "SELECT id, token FROM guests WHERE id=?", (guest_id,)
+            "SELECT id, token FROM guests WHERE id = ?",
+            (guest_id,),
         ).fetchone()
 
+
+# ============================================================
+# Security headers
+# ============================================================
 
 @app.after_request
 def security_headers(response):
@@ -98,6 +168,10 @@ def security_headers(response):
     return response
 
 
+# ============================================================
+# Pages
+# ============================================================
+
 @app.get("/")
 def home():
     return render_template("landing.html")
@@ -106,15 +180,21 @@ def home():
 @app.get("/app")
 def workspace():
     guest = current_guest()
+
     with db() as connection:
-        history = [
-            dict(row)
-            for row in connection.execute(
-                "SELECT role, content FROM messages WHERE guest_id=? "
-                "ORDER BY id DESC LIMIT 40",
-                (guest["id"],),
-            ).fetchall()
-        ][::-1]
+        rows = connection.execute(
+            """
+            SELECT role, content
+            FROM messages
+            WHERE guest_id = ?
+            ORDER BY id DESC
+            LIMIT 40
+            """,
+            (guest["id"],),
+        ).fetchall()
+
+    history = [dict(row) for row in rows][::-1]
+
     return render_template(
         "app.html",
         user={"username": "زائر", "role": "writer"},
@@ -122,55 +202,16 @@ def workspace():
     )
 
 
-@app.post("/api/chat")
-def chat():
-    guest = current_guest()
-    payload = request.get_json(silent=True) or {}
-    message = str(payload.get("message", "")).strip()
+# ============================================================
+# Gemini response
+# ============================================================
 
-    if not message:
-        return jsonify(error="اكتب رسالة أولاً."), 400
-    if len(message) > 6000:
-        return jsonify(error="الرسالة أطول من الحد المسموح (6000 حرف)."), 413
+def generate_rio_answer(api_key, prompt, instructions):
+    client = genai.Client(api_key=api_key)
 
-    api_key = GEMINI_API_KEY.strip()
-    if not api_key or api_key == "PASTE_NEW_GEMINI_API_KEY_HERE":
-        return jsonify(
-            error="أضف مفتاح Gemini الجديد في أعلى ملف app.py ثم أعد تشغيل RIO."
-        ), 503
-
-    with db() as connection:
-        previous = connection.execute(
-            "SELECT role, content FROM messages WHERE guest_id=? "
-            "ORDER BY id DESC LIMIT 12",
-            (guest["id"],),
-        ).fetchall()[::-1]
-        connection.execute(
-            "INSERT INTO messages(guest_id, role, content, created_at) "
-            "VALUES(?, 'user', ?, ?)",
-            (guest["id"], message, now()),
-        )
-        connection.commit()
-
-    conversation = [
-        ("User: " if row["role"] == "user" else "RIO: ") + row["content"]
-        for row in previous
-    ]
-    conversation.append("User: " + message)
-    prompt = "\n\n".join(conversation)
-
-    instructions = (
-        "You are RIO, a warm, imaginative bilingual creative companion focused on novels, books, "
-        "and storytelling. Reply in the same language as the user's latest message. Help with "
-        "characters, relationships, plot, scenes, dialogue, worldbuilding, summaries, reading "
-        "recommendations, and continuity. Be collaborative, expressive, and clear. Do not claim "
-        "permanent memory beyond the conversation history provided."
-    )
-
-    try:
-        client = genai.Client(api_key=api_key)
-        # New Gemini authorization keys (often beginning with "AQ")
-        # should use the Interactions API rather than GenerateContent.
+    # Google AI Studio authorization keys beginning with AQ.
+    # Use the Interactions API for this key type.
+    if api_key.startswith("AQ."):
         result = client.interactions.create(
             model=MODEL,
             input=prompt,
@@ -180,19 +221,118 @@ def chat():
                 "max_output_tokens": 1200,
             },
         )
-        answer = (getattr(result, "output_text", None) or "").strip()
+
+        return (getattr(result, "output_text", None) or "").strip()
+
+    # Conventional Gemini API keys use GenerateContent.
+    result = client.models.generate_content(
+        model=MODEL,
+        contents=prompt,
+        config={
+            "system_instruction": instructions,
+            "temperature": 0.8,
+            "max_output_tokens": 1200,
+        },
+    )
+
+    return (getattr(result, "text", None) or "").strip()
+
+
+# ============================================================
+# Chat API
+# ============================================================
+
+@app.post("/api/chat")
+def chat():
+    guest = current_guest()
+    payload = request.get_json(silent=True) or {}
+    message = str(payload.get("message", "")).strip()
+
+    if not message:
+        return jsonify(error="اكتب رسالة أولاً."), 400
+
+    if len(message) > 6000:
+        return jsonify(
+            error="الرسالة أطول من الحد المسموح (6000 حرف)."
+        ), 413
+
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+
+    if not api_key:
+        return jsonify(
+            error=(
+                "مفتاح Gemini غير مضبوط. أضف GEMINI_API_KEY "
+                "في إعدادات البيئة ثم أعد تشغيل التطبيق."
+            )
+        ), 503
+
+    with db() as connection:
+        previous = connection.execute(
+            """
+            SELECT role, content
+            FROM messages
+            WHERE guest_id = ?
+            ORDER BY id DESC
+            LIMIT 12
+            """,
+            (guest["id"],),
+        ).fetchall()[::-1]
+
+        connection.execute(
+            """
+            INSERT INTO messages(guest_id, role, content, created_at)
+            VALUES(?, 'user', ?, ?)
+            """,
+            (guest["id"], message, now()),
+        )
+        connection.commit()
+
+    conversation = [
+        ("User: " if row["role"] == "user" else "RIO: ")
+        + row["content"]
+        for row in previous
+    ]
+    conversation.append("User: " + message)
+    prompt = "\n\n".join(conversation)
+
+    instructions = (
+        "You are RIO, a warm, imaginative bilingual creative companion "
+        "focused on novels, books, and storytelling. Reply in the same "
+        "language as the user's latest message. Help with characters, "
+        "relationships, plot, scenes, dialogue, worldbuilding, summaries, "
+        "reading recommendations, and continuity. Be collaborative, "
+        "expressive, and clear. Do not claim permanent memory beyond the "
+        "conversation history provided."
+    )
+
+    try:
+        answer = generate_rio_answer(
+            api_key=api_key,
+            prompt=prompt,
+            instructions=instructions,
+        )
+
         if not answer:
-            answer = "لم يصلني رد نصي هذه المرة. جرّب صياغة سؤالك مرة أخرى."
+            answer = (
+                "لم يصلني رد نصي هذه المرة. "
+                "جرّب صياغة سؤالك مرة أخرى."
+            )
+
     except Exception:
+        # Never log the API key or its value.
         app.logger.exception("Gemini request failed")
         return jsonify(
-            error="تعذر الاتصال بـ Gemini. تحقق من المفتاح والحصة واسم النموذج في إعدادات RIO."
+            error=(
+                "تعذر الاتصال بـ RIO. "
+            )
         ), 502
 
     with db() as connection:
         connection.execute(
-            "INSERT INTO messages(guest_id, role, content, created_at) "
-            "VALUES(?, 'assistant', ?, ?)",
+            """
+            INSERT INTO messages(guest_id, role, content, created_at)
+            VALUES(?, 'assistant', ?, ?)
+            """,
             (guest["id"], answer, now()),
         )
         connection.commit()
@@ -200,16 +340,27 @@ def chat():
     return jsonify(answer=answer)
 
 
+# ============================================================
+# Clear chat
+# ============================================================
+
 @app.post("/api/clear")
 def clear_chat():
     guest = current_guest()
+
     with db() as connection:
         connection.execute(
-            "DELETE FROM messages WHERE guest_id=?", (guest["id"],)
+            "DELETE FROM messages WHERE guest_id = ?",
+            (guest["id"],),
         )
         connection.commit()
+
     return jsonify(ok=True)
 
+
+# ============================================================
+# Health check
+# ============================================================
 
 @app.get("/health")
 def health():
@@ -222,6 +373,7 @@ def health():
 
 
 init_db()
+
 
 if __name__ == "__main__":
     app.run(
