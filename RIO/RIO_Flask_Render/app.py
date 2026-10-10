@@ -169,16 +169,18 @@ def chat():
 
     try:
         client = genai.Client(api_key=api_key)
-        result = client.models.generate_content(
+        # New Gemini authorization keys (often beginning with "AQ")
+        # should use the Interactions API rather than GenerateContent.
+        result = client.interactions.create(
             model=MODEL,
-            contents=prompt,
-            config={
-                "system_instruction": instructions,
+            input=prompt,
+            system_instruction=instructions,
+            generation_config={
                 "temperature": 0.8,
                 "max_output_tokens": 1200,
             },
         )
-        answer = (getattr(result, "text", None) or "").strip()
+        answer = (getattr(result, "output_text", None) or "").strip()
         if not answer:
             answer = "لم يصلني رد نصي هذه المرة. جرّب صياغة سؤالك مرة أخرى."
     except Exception:
