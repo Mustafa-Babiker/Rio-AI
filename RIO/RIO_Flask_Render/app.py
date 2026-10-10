@@ -11,7 +11,7 @@ from google import genai
 # Do not use a Gemini API key that has already been exposed.
 # ============================================================
 SECRET_KEY = "e3982c9f526afb7c2e0ec3a91ccccd791a458bfb6e8c0fd5c245eb082069c50c"
-GEMINI_API_KEY = "AQ.Ab8RN6L-SW0m4Y-q_IzKf1BDJK5klDzqnCMt7adJPlXm3zAPGw"
+GEMINI_API_KEY = "AQ.Ab8RN6KkixaecqBYColB4vK9iF78Zzm46pkRFB5WXQZmdFBDNA"
 GEMINI_MODEL = "gemini-3.8-flash"
 COOKIE_SECURE = False  # Set True only when using HTTPS in production.
 
