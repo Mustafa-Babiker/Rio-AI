@@ -56,7 +56,7 @@ SECRET_KEY = (
     or secrets.token_hex(32)
 )
 
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "Gemini 3.5 Flash Lite").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
 
 COOKIE_SECURE = os.getenv(
     "COOKIE_SECURE",
